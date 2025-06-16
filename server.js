@@ -179,6 +179,11 @@ app.post('/api/matches', auth, (req, res) => {
         console.error('Error inserting match:', err);
         return res.status(500).json({ message: 'Server Error', error: err.message });
       }
+      // Emit to all clients (admins and players)
+      io.emit('match_created', {
+        matchId: this.lastID,
+        category, format, map, entryFee, prizePool, scheduledAt, status: 'scheduled'
+      });
       res.json({ matchId: this.lastID });
     }
   );
@@ -254,7 +259,7 @@ app.post('/api/matches/:id/request-join', auth, (req, res) => {
             // Notify all connected admins
             Object.keys(connectedUsers).forEach(uid => {
               connectedUsers[uid].forEach(socket => {
-                if (socket.isAdmin) {
+                if (socket.user?.role === 'admin') {
                   socket.emit('join_request', {
                     matchId,
                     userId,
@@ -264,6 +269,29 @@ app.post('/api/matches/:id/request-join', auth, (req, res) => {
                 }
               });
             });
+
+            // Notify the player (self)
+            if (connectedUsers[userId]) {
+              connectedUsers[userId].forEach(socket => {
+                socket.emit('join_request_submitted', {
+                  matchId,
+                  status: 'pending'
+                });
+              });
+              sendNotification(userId, 'Your join request has been sent and is pending admin approval.', 'info', { matchId });
+            }
+
+            // Notify all clients about player count update for this match
+            db.get(
+              `SELECT COUNT(*) as joinedCount FROM join_requests WHERE matchId = ? AND status = 'approved'`,
+              [matchId],
+              (err, row) => {
+                io.emit('match_players_update', {
+                  matchId,
+                  joinedCount: row?.joinedCount || 0
+                });
+              }
+            );
 
             res.json({ message: 'Join request submitted. Await admin confirmation.' });
           }
@@ -326,6 +354,20 @@ app.post('/api/admin/join-requests/:id/decision', auth, (req, res) => {
               });
             }
 
+            // Notify all clients about player count update for this match
+            db.get(
+              `SELECT COUNT(*) as joinedCount FROM join_requests WHERE matchId = ? AND status = 'approved'`,
+              [jr.matchId],
+              (err, row) => {
+                io.emit('match_players_update', {
+                  matchId: jr.matchId,
+                  joinedCount: row?.joinedCount || 0
+                });
+              }
+            );
+
+            sendNotification(jr.userId, 'Your join request was approved! Room details are available.', 'success', { matchId });
+
             res.json({ message: 'Join request approved and room details saved' });
           }
         );
@@ -338,6 +380,18 @@ app.post('/api/admin/join-requests/:id/decision', auth, (req, res) => {
             });
           });
         }
+        // Notify all clients about player count update for this match
+        db.get(
+          `SELECT COUNT(*) as joinedCount FROM join_requests WHERE matchId = ? AND status = 'approved'`,
+          [jr.matchId],
+          (err, row) => {
+            io.emit('match_players_update', {
+              matchId: jr.matchId,
+              joinedCount: row?.joinedCount || 0
+            });
+          }
+        );
+        sendNotification(jr.userId, 'Your join request was rejected by admin.', 'error', { matchId: jr.matchId });
         res.json({ message: 'Join request rejected' });
       }
     });
@@ -434,6 +488,7 @@ app.post('/api/matches/:id/results', auth, (req, res) => {
                 prize: r.prize
               });
             });
+            sendNotification(r.userId, `Match completed! You placed #${r.rank} and won ₹${r.prize}.`, 'info', { matchId });
           }
           completed++;
           // After all results processed, emit leaderboard and respond
@@ -462,10 +517,10 @@ app.post('/api/matches/:id/results', auth, (req, res) => {
   });
 });
 
-// Get leaderboard for a match
-app.get('/api/matches/:id/leaderboard', auth, (req, res) => {
+// Get all results for a match (admin only)
+app.get('/api/matches/:id/results', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ message: 'Forbidden' });
   const matchId = parseInt(req.params.id);
-
   db.all(
     `SELECT mr.rank, mr.prize, u.username, u.id as userId
      FROM match_results mr
@@ -475,50 +530,42 @@ app.get('/api/matches/:id/leaderboard', auth, (req, res) => {
     [matchId],
     (err, rows) => {
       if (err) return res.status(500).json({ message: 'Server Error' });
+      if (!rows.length) return res.status(404).json({ message: 'No results found for this match.' });
       res.json(rows);
     }
   );
 });
 
-// Get player profile (self or admin)
-app.get('/api/users/:id/profile', auth, (req, res) => {
-  const userId = parseInt(req.params.id);
+// Get a user's result for a specific match
+app.get('/api/matches/:matchId/user/:userId/result', auth, (req, res) => {
+  const matchId = parseInt(req.params.matchId);
+  const userId = parseInt(req.params.userId);
   if (userId !== req.user.id && req.user.role !== 'admin') {
     return res.status(403).json({ message: 'Forbidden' });
   }
-  db.get('SELECT id, username, email, role, walletBalance FROM users WHERE id = ?', [userId], (err, row) => {
-    if (err || !row) return res.status(404).json({ message: 'User not found' });
-    res.json(row);
-  });
-});
-
-// Admin posts a new announcement
-app.post('/api/announcements', auth, (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ message: 'Forbidden' });
-  const { message } = req.body;
-  if (!message) return res.status(400).json({ message: 'Message required' });
-  db.run(
-    'INSERT INTO announcements (message) VALUES (?)',
-    [message],
-    function (err) {
+  db.get(
+    `SELECT mr.rank, mr.prize, m.category, m.scheduledAt
+     FROM match_results mr
+     JOIN matches m ON mr.matchId = m.id
+     WHERE mr.matchId = ? AND mr.userId = ?`,
+    [matchId, userId],
+    (err, row) => {
       if (err) return res.status(500).json({ message: 'Server Error' });
-      res.json({ id: this.lastID, message });
+      if (!row) return res.status(404).json({ message: 'No result found for this user in this match.' });
+      res.json(row);
     }
   );
 });
 
-// All users fetch latest announcements (public, no auth)
-app.get('/api/announcements', (req, res) => {
-  db.all('SELECT * FROM announcements ORDER BY createdAt DESC LIMIT 10', [], (err, rows) => {
-    if (err) return res.status(500).json({ message: 'Server Error' });
-    res.json(rows);
-  });
-});
-
-// Get all matches (admin only)
-app.get('/api/matches', auth, (req, res) => {
-  if (req.user.role !== 'admin') return res.status(403).json({ message: 'Forbidden' });
-  db.all('SELECT * FROM matches ORDER BY scheduledAt DESC', [],
+// Get all winners for a match (rank = 1)
+app.get('/api/matches/:id/winners', auth, (req, res) => {
+  const matchId = parseInt(req.params.id);
+  db.all(
+    `SELECT mr.rank, mr.prize, u.username, u.id as userId
+     FROM match_results mr
+     JOIN users u ON mr.userId = u.id
+     WHERE mr.matchId = ? AND mr.rank = 1`,
+    [matchId],
     (err, rows) => {
       if (err) return res.status(500).json({ message: 'Server Error' });
       res.json(rows);
@@ -526,49 +573,26 @@ app.get('/api/matches', auth, (req, res) => {
   );
 });
 
-// Get today's matches
-app.get('/api/matches/today', auth, (req, res) => {
-  const today = new Date();
-  const yyyy = today.getFullYear();
-  const mm = String(today.getMonth() + 1).padStart(2, '0');
-  const dd = String(today.getDate()).padStart(2, '0');
-  const start = `${yyyy}-${mm}-${dd} 00:00:00`;
-  const end = `${yyyy}-${mm}-${dd} 23:59:59`;
+// Improve leaderboard endpoint: include match info
+app.get('/api/matches/:id/leaderboard', auth, (req, res) => {
+  const matchId = parseInt(req.params.id);
 
-  db.all(
-    `SELECT * FROM matches WHERE scheduledAt BETWEEN ? AND ? ORDER BY scheduledAt ASC`,
-    [start, end],
-    (err, rows) => {
-      if (err) return res.status(500).json({ message: 'Server Error' });
-      res.json(rows);
-    }
-  );
-});
+  db.get('SELECT * FROM matches WHERE id = ?', [matchId], (err, match) => {
+    if (err || !match) return res.status(404).json({ message: 'Match not found' });
 
-// Get matches available for the player to join (not started, not completed, not already joined/requested)
-app.get('/api/matches/available', auth, (req, res) => {
-  const userId = req.user.id;
-  db.all(
-    `
-    SELECT m.*,
-      (SELECT COUNT(*) FROM join_requests jr WHERE jr.matchId = m.id AND jr.status = 'approved') AS joinedCount,
-      (SELECT status FROM join_requests jr WHERE jr.matchId = m.id AND jr.userId = ?) AS myRequestStatus
-    FROM matches m
-    WHERE m.status = 'scheduled'
-    ORDER BY m.scheduledAt ASC
-    `,
-    [userId],
-    (err, rows) => {
-      if (err) return res.status(500).json({ message: 'Server Error' });
-      // Mark if user can join or already requested/joined
-      const matches = rows.map(row => ({
-        ...row,
-        canJoin: !row.myRequestStatus,
-        myRequestStatus: row.myRequestStatus || null
-      }));
-      res.json(matches);
-    }
-  );
+    db.all(
+      `SELECT mr.rank, mr.prize, u.username, u.id as userId
+       FROM match_results mr
+       JOIN users u ON mr.userId = u.id
+       WHERE mr.matchId = ?
+       ORDER BY mr.rank ASC`,
+      [matchId],
+      (err, rows) => {
+        if (err) return res.status(500).json({ message: 'Server Error' });
+        res.json({ match, leaderboard: rows });
+      }
+    );
+  });
 });
 
 // Socket.io setup
@@ -658,8 +682,91 @@ app.post('/api/matches/:id/room', auth, (req, res) => {
   );
 });
 
+// Edit a match (admin only)
+app.put('/api/matches/:id', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ message: 'Forbidden' });
+  const matchId = parseInt(req.params.id);
+  const { category, format, map, entryFee, prizePool, scheduledAt, status } = req.body;
+  db.run(
+    `UPDATE matches SET category=?, format=?, map=?, entryFee=?, prizePool=?, scheduledAt=?, status=? WHERE id=?`,
+    [category, format, map, entryFee, prizePool, scheduledAt, status, matchId],
+    function (err) {
+      if (err) return res.status(500).json({ message: 'Server Error' });
+      res.json({ message: 'Match updated', matchId });
+    }
+  );
+});
+
+// Delete a match (admin only)
+app.delete('/api/matches/:id', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ message: 'Forbidden' });
+  const matchId = parseInt(req.params.id);
+  db.run('DELETE FROM matches WHERE id = ?', [matchId], function (err) {
+    if (err) return res.status(500).json({ message: 'Server Error' });
+    res.json({ message: 'Match deleted', matchId });
+  });
+});
+
+// View all join requests for a match (admin only)
+app.get('/api/matches/:id/join-requests', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ message: 'Forbidden' });
+  const matchId = parseInt(req.params.id);
+  db.all(
+    `SELECT jr.*, u.username FROM join_requests jr JOIN users u ON jr.userId = u.id WHERE jr.matchId = ?`,
+    [matchId],
+    (err, rows) => {
+      if (err) return res.status(500).json({ message: 'Server Error' });
+      res.json(rows);
+    }
+  );
+});
+
+// Search matches by category, status, or date (admin only)
+app.get('/api/admin/matches/search', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ message: 'Forbidden' });
+  const { category, status, date } = req.query;
+  let sql = 'SELECT * FROM matches WHERE 1=1';
+  const params = [];
+  if (category) {
+    sql += ' AND category = ?';
+    params.push(category);
+  }
+  if (status) {
+    sql += ' AND status = ?';
+    params.push(status);
+  }
+  if (date) {
+    sql += ' AND DATE(scheduledAt) = ?';
+    params.push(date);
+  }
+  sql += ' ORDER BY scheduledAt DESC';
+  db.all(sql, params, (err, rows) => {
+    if (err) return res.status(500).json({ message: 'Server Error' });
+    res.json(rows);
+  });
+});
+
+// List all users (admin only)
+app.get('/api/admin/users', auth, (req, res) => {
+  if (req.user.role !== 'admin') return res.status(403).json({ message: 'Forbidden' });
+  db.all('SELECT id, username, email, role, walletBalance FROM users', [], (err, rows) => {
+    if (err) return res.status(500).json({ message: 'Server Error' });
+    res.json(rows);
+  });
+});
+
+// Add this helper function near the top, after connectedUsers is defined
+
+function sendNotification(userId, message, type = 'info', data = {}) {
+  if (connectedUsers[userId]) {
+    connectedUsers[userId].forEach(socket => {
+      socket.emit('notification', { message, type, ...data });
+    });
+  }
+}
+
 // Start server
-const PORT = process.env.PORT || 4000;
+const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
